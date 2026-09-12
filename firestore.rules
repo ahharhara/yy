@@ -1,0 +1,163 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // --- Helper Functions & Zero-Trust RBAC ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function getUserRole() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+        : 'guest';
+    }
+    
+    function isSuperAdmin() {
+      return getUserRole() == 'super_admin';
+    }
+    
+    function isDeveloper() {
+      return getUserRole() == 'developer';
+    }
+    
+    function isAdmin() {
+      return isSuperAdmin() || isDeveloper() || getUserRole() == 'admin';
+    }
+    
+    function isOperations() {
+      return isAdmin() || getUserRole() == 'operations';
+    }
+    
+    function isFinance() {
+      return isAdmin() || getUserRole() == 'finance';
+    }
+    
+    function isSupport() {
+      return isAdmin() || getUserRole() == 'support';
+    }
+    
+    function isMerchant() {
+      return getUserRole() == 'merchant';
+    }
+    
+    function isDriver() {
+      return getUserRole() == 'driver';
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    // --- Store Catalog: Products ---
+    match /products/{productId} {
+      allow read: if true;
+      allow create, update: if isSignedIn() && (
+        isAdmin() || 
+        (isMerchant() && request.resource.data.merchantId == request.auth.uid)
+      );
+      allow delete: if isSignedIn() && (
+        isAdmin() || 
+        (isMerchant() && resource.data.merchantId == request.auth.uid)
+      );
+    }
+    
+    // --- Store Catalog: Categories ---
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isSignedIn() && isAdmin();
+    }
+    
+    // --- Payment Methods Configuration ---
+    match /paymentMethods/{paymentMethodId} {
+      allow read: if true;
+      allow write: if isSignedIn() && (isAdmin() || isFinance());
+    }
+    match /payment_methods/{paymentMethodId} {
+      allow read: if true;
+      allow write: if isSignedIn() && (isAdmin() || isFinance());
+    }
+    
+    // --- Customer Orders ---
+    match /orders/{orderId} {
+      allow read: if isSignedIn() && (
+        isOperations() || 
+        isDriver() || 
+        resource.data.customerId == request.auth.uid ||
+        resource.data.customerPhone == request.auth.token.phone_number
+      );
+      // Only authenticated user can create order for themselves
+      allow create: if isSignedIn() && request.resource.data.customerId == request.auth.uid;
+      // Customers cannot tamper with price, discounts, or payment status
+      allow update: if isSignedIn() && (
+        isOperations() || 
+        (isDriver() && resource.data.driverId == request.auth.uid) ||
+        (resource.data.customerId == request.auth.uid && 
+         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['total', 'subtotal', 'discount', 'vat', 'deliveryFee', 'paymentStatus']))
+      );
+      allow delete: if isSignedIn() && isSuperAdmin();
+    }
+    
+    // --- User Accounts & RBAC ---
+    match /users/{userId} {
+      allow read: if isSignedIn() && (
+        request.auth.uid == userId || 
+        isSupport() || 
+        isOperations() || 
+        isAdmin()
+      );
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      // Prevent user from elevating role, activating suspended status, or forging walletBalance
+      allow update: if isSignedIn() && (
+        (request.auth.uid == userId && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'status', 'walletBalance'])) ||
+        isDeveloper() || 
+        isSuperAdmin() ||
+        isFinance()
+      );
+      allow delete: if isSignedIn() && isSuperAdmin();
+    }
+
+    // --- Double-Entry Wallet Ledger Transactions (Strictly Immutable) ---
+    match /wallet_transactions/{txId} {
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        isFinance() ||
+        isAdmin()
+      );
+      // Only finance/admin or backend processes can record verified financial ledger entries
+      allow create: if isSignedIn() && (isFinance() || isAdmin() || isDeveloper());
+      allow update, delete: if false; // Strict financial ledger: NO MUTATION OR DELETION
+    }
+
+    // --- Promotional Coupons ---
+    match /coupons/{couponId} {
+      allow read: if true;
+      allow write: if isSignedIn() && isAdmin();
+    }
+    
+    // --- Audit Logs (Append-Only, Strictly Immutable) ---
+    match /audit_logs/{logId} {
+      allow read: if isSignedIn() && (isDeveloper() || isSuperAdmin());
+      allow create: if isSignedIn();
+      allow update, delete: if false; // Zero-Trust: Audit trails can NEVER be altered or pruned
+    }
+    
+    // --- System Configuration & Remote Config & Kill Switches ---
+    match /system_config/{configId} {
+      allow read: if true; // Publicly accessible to verify maintenance mode and minimum orders
+      allow write: if isSignedIn() && (isDeveloper() || isSuperAdmin());
+    }
+    
+    // --- Customer Complaints & Support Tickets ---
+    match /complaints/{complaintId} {
+      allow read: if isSignedIn() && (
+        isSupport() || 
+        isAdmin() || 
+        resource.data.customerPhone == request.auth.token.phone_number
+      );
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && (isSupport() || isAdmin());
+      allow delete: if isSignedIn() && isSuperAdmin();
+    }
+  }
+}
